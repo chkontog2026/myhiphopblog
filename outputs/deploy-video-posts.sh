@@ -54,7 +54,7 @@ check_file() {
   [[ "$actual" == "$expected_old" || "$actual" == "$expected_new" ]] || { echo "Deployment stopped: remote $name differs from the tested checkout. No production files were changed." >&2; exit 1; }
   [[ $(sha256sum "$stage/$name" | cut -d ' ' -f 1) == "$expected_new" ]] || { echo "Invalid payload: $name" >&2; exit 1; }
 }
-check_file "server.mjs" "71746363d57326f20ff5764412754d1d176aa43a41fb132f12af47560fd4f118" "29df273ddaf541abf366f0fcd983163390782b4647f667e1bd76c1d35764a71d"
+check_file "server.mjs" "d75240e363d3964b35cd6be49e630dd13cdb5a18200b3be2c7b5a1f5dfc8ef45" "4e98ad79b8a36bee8ebf64f0713ebb75d30ec3fd43888aec7336f5ae6d067c0b"
 check_file "owned-video.mjs" "MISSING" "e81771a4bcb67adbb06ca8f6f7136f865453f3ad96e8043cba8e06e8fdabf6c9"
 check_file "public/admin-upload.js" "310193a1e31d664cae7df8a4eeb576f29e702317dc5d421f83b7ce1682b641b4" "29e831fbc170c5378e3893118f2417668b77152c4cb8663d513eae7f1ddc2d78"
 check_file "public/youtube-embed.css" "48542abcb1c20989d9eb083acc11a76b61bde596d1c0f5ac926959a04ca13828" "b6acb8e8137b882071703b0539c4b89c368ddfe5937b497d576e7ed62c9dd4df"

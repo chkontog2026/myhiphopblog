@@ -19,7 +19,6 @@ import { normalizeYouTubeUrl, youtubeEmbedUrl, youtubeVideoId } from "./youtube-
 import { normalizeSpotifyUrl, spotifyEmbedUrl, spotifyResource } from "./spotify-embed.mjs";
 import { extractYouTubePublishedYear, parseYouTubeMetadata } from "./youtube-metadata.mjs";
 import { parseProxyProbeOutput, parseProxyUrls, proxyIdentity, rankProxyUrls, sanitizeYouTubeError, youtubeAccessArgs, youtubeMp4Format, runYouTubeProxyAttempts, youtubeFailureCode, youtubeFailureMessage } from "./youtube-download.mjs";
-
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || path.join(root, "data");
 const uploadDir = path.join(dataDir, "uploads");
@@ -45,6 +44,9 @@ const r2SecretAccessKey = text(process.env.R2_SECRET_ACCESS_KEY);
 const r2Bucket = text(process.env.R2_BUCKET);
 const r2PublicUrl = text(process.env.R2_PUBLIC_URL).replace(/\/$/, "");
 const r2Enabled = Boolean(r2AccountId && r2AccessKeyId && r2SecretAccessKey && r2Bucket && r2PublicUrl);
+const lumoBlogStorageUrl = (text(process.env.LUMO_BLOG_STORAGE_URL) || "http://127.0.0.1:3047").replace(/\/$/, "");
+const lumoBlogStorageToken = text(process.env.LUMO_BLOG_STORAGE_TOKEN);
+const lumoBlogStorageEnabled = Boolean(lumoBlogStorageUrl && lumoBlogStorageToken);
 const discogsTokenFile = path.join(dataDir, "discogs-token");
 let discogsTokenStatus = "unknown";
 const youtubeProxyUrls = parseProxyUrls(process.env.WEBSHARE_PROXY_URLS);
@@ -77,6 +79,7 @@ const objectStorage = b2Enabled ? {
     credentials: { accessKeyId: r2AccessKeyId, secretAccessKey: r2SecretAccessKey },
   }),
 } : null;
+const downloadStorageProvider = lumoBlogStorageEnabled ? "LUMO Cloud" : objectStorage?.provider || "";
 
 if (adminPassword.length < 11 || sessionSecret.length < 32) {
   throw new Error("ADMIN_PASSWORD (11+ chars) and SESSION_SECRET (32+ chars) are required.");
@@ -347,6 +350,16 @@ app.get("/downloads/:id", async (req, res, next) => {
     if (!fs.existsSync(filePath)) return res.status(404).send("Not found");
     recordUniqueDownload(id, req);
     return res.download(filePath, normalizeDownloadFilename(release.download_name || name));
+  }
+
+  if (isLumoBlogStorageKey(release.download_key)) {
+    recordUniqueDownload(id, req);
+    const signed = await lumoBlogStorageRequest("/api/v1/blog-storage/downloads", {
+      method: "POST",
+      body: { key: release.download_key, fileName: normalizeDownloadFilename(release.download_name) },
+    });
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.redirect(302, signed.url);
   }
 
   if (release.download_key && objectStorage?.signedDownloads) {
@@ -719,7 +732,7 @@ app.post("/admin/releases/save", uploadFields, async (req, res, next) => {
       downloadKey = "";
       downloadName = "";
     } else if (downloadFile) {
-      if (objectStorage) {
+      if (lumoBlogStorageEnabled || objectStorage) {
         const stored = await storeDownloadObject(downloadFile);
         downloadUrl = stored.url;
         downloadKey = stored.key;
@@ -984,7 +997,7 @@ function releaseForm(r, csrf, adminPage = 1) {
   const formScope = `release-form-${r?.id || "new"}`;
   return `<form class="release-form" method="post" action="/admin/releases/save" enctype="multipart/form-data" data-has-cover="${r?.cover_url ? "1" : "0"}"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${r?.id || ""}"><input type="hidden" name="admin_page" value="${adminPage}"><input type="hidden" name="discogs_cover_url" value="">
     <nav class="release-form-nav" aria-label="Γρήγορη μετάβαση και ενέργειες φόρμας"><div class="release-form-nav-links"><span>Μετάβαση:</span><a href="#${formScope}-basics">Βασικά</a><a href="#${formScope}-media">Discogs &amp; εξώφυλλο</a><a href="#${formScope}-tracks">Tracklist</a><a href="#${formScope}-content">Περιγραφή</a><a href="#${formScope}-extras">Προαιρετικά</a></div><div class="release-form-nav-actions"><button class="release-preview" type="submit" formaction="/admin/releases/preview" formtarget="_blank">Preview</button><button class="release-save" type="submit" name="publish_action" value="save">Αποθήκευση Ανάρτησης</button><button class="primary release-publish" type="submit" name="publish_action" value="publish">Δημοσίευση</button></div></nav>
-    <div id="${formScope}-basics" class="release-editor-top release-anchor"><section class="release-primary-upload"><div class="release-card-heading"><span class="release-step">1</span><div><strong>Αρχείο μουσικής</strong><small>Επίλεξέ το πρώτο για αυτόματη αναγνώριση.</small></div></div><label>Μουσική / ZIP (έως 500 MB)${objectStorage ? ` — ${objectStorage.provider}` : ""}<input type="file" name="download_file" accept="audio/*,.zip,.rar,.7z,.flac"></label><label class="youtube-download-enabled"><input type="checkbox" name="download_enabled" value="1" ${!r || r.download_enabled ? "checked" : ""}> Ενεργό Download στο post</label><small>Χωρίς ξεχωριστό αρχείο μουσικής ή download URL, το Download κατεβάζει το δικό σου βίντεο.</small><details class="release-optional"${downloadExternal ? " open" : ""}><summary>Εναλλακτικό download URL</summary><label>Download URL<input type="url" name="download_url" value="${attr(downloadExternal)}"></label></details></section><section class="release-essential-card"><div class="release-card-heading"><span class="release-step">2</span><div><strong>Βασικά στοιχεία</strong><small>Καλλιτέχνης, τίτλος και χρονολογία.</small></div></div><div class="form-grid"><label>Καλλιτέχνης<input name="artist" value="${attr(r?.artist || "")}" required></label><label>Τίτλος<input name="title" value="${attr(r?.title || "")}" required></label><label>Χρονολογία κυκλοφορίας<input type="number" name="release_date" min="1900" max="2099" step="1" placeholder="π.χ. 1999" value="${attr(releaseYear(r?.release_date))}"></label><label>Ημερομηνία ανάρτησης<input type="date" name="publish_date" value="${attr(r?.publish_date || dateInTimeZone(new Date(), siteTimeZone))}" required></label></div></section></div>
+    <div id="${formScope}-basics" class="release-editor-top release-anchor"><section class="release-primary-upload"><div class="release-card-heading"><span class="release-step">1</span><div><strong>Αρχείο μουσικής</strong><small>Επίλεξέ το πρώτο για αυτόματη αναγνώριση.</small></div></div><label>Μουσική / ZIP (έως 500 MB)${downloadStorageProvider ? ` — ${downloadStorageProvider}` : ""}<input type="file" name="download_file" accept="audio/*,.zip,.rar,.7z,.flac"></label><label class="youtube-download-enabled"><input type="checkbox" name="download_enabled" value="1" ${!r || r.download_enabled ? "checked" : ""}> Ενεργό Download στο post</label><small>Χωρίς ξεχωριστό αρχείο μουσικής ή download URL, το Download κατεβάζει το δικό σου βίντεο.</small><details class="release-optional"${downloadExternal ? " open" : ""}><summary>Εναλλακτικό download URL</summary><label>Download URL<input type="url" name="download_url" value="${attr(downloadExternal)}"></label></details></section><section class="release-essential-card"><div class="release-card-heading"><span class="release-step">2</span><div><strong>Βασικά στοιχεία</strong><small>Καλλιτέχνης, τίτλος και χρονολογία.</small></div></div><div class="form-grid"><label>Καλλιτέχνης<input name="artist" value="${attr(r?.artist || "")}" required></label><label>Τίτλος<input name="title" value="${attr(r?.title || "")}" required></label><label>Χρονολογία κυκλοφορίας<input type="number" name="release_date" min="1900" max="2099" step="1" placeholder="π.χ. 1999" value="${attr(releaseYear(r?.release_date))}"></label><label>Ημερομηνία ανάρτησης<input type="date" name="publish_date" value="${attr(r?.publish_date || dateInTimeZone(new Date(), siteTimeZone))}" required></label></div></section></div>
     <div id="${formScope}-media" class="release-media-grid release-anchor"><div class="release-discogs-panel"><div class="release-card-heading"><span class="release-step">3</span><div><strong>Συμπλήρωση από Discogs</strong><small>Στοιχεία, εξώφυλλο και αριθμημένο tracklist.</small></div></div><button class="discogs-fetch" type="button" ${getDiscogsToken() ? "" : "disabled"}>Εύρεση στο Discogs</button><span class="discogs-message" role="status" aria-live="polite"></span></div><section class="release-content-card release-cover-card"><div class="release-card-heading"><span class="release-step">4</span><div><strong>Εξώφυλλο</strong><small>Ανέβασε εικόνα ή χρησιμοποίησε URL εξωφύλλου.</small></div></div><div class="form-grid uploads"><label>Αρχείο εικόνας<input type="file" name="cover" accept="image/*"></label><label>ή URL εξωφύλλου<input type="url" name="cover_url" value="${attr(coverExternal)}"></label></div></section></div>
     <section id="${formScope}-tracks" class="release-tracklist-editor release-anchor"><div class="release-card-heading"><span class="release-step">5</span><div><strong>Tracklist</strong><small>Επικόλλησε λίστα από Discogs και πάτησε «Κράτησε μόνο τίτλους».</small></div></div><div class="disc-editor disc-editor-primary"><div class="disc-editor-heading"><strong>CD 1</strong><label>Προαιρετικός τίτλος<input name="disc_1_label" value="${attr(trackFields.disc1Label)}" placeholder="π.χ. L'album Original"></label></div><div class="tracklist-paste-tools"><button type="button" data-clean-tracklist>Κράτησε μόνο τίτλους</button><span data-tracklist-clean-message role="status" aria-live="polite"></span></div><textarea name="tracks" rows="7" aria-label="Tracklist CD 1">${esc(trackFields.disc1)}</textarea></div><label class="second-disc-toggle"><input type="checkbox" name="has_second_disc" value="1" ${hasSecondDisc ? "checked" : ""}> Ο δίσκος έχει και 2ο CD</label><div class="disc-editor disc-editor-secondary" ${hasSecondDisc ? "" : "hidden"}><div class="disc-editor-heading"><strong>CD 2</strong><label>Προαιρετικός τίτλος<input name="disc_2_label" value="${attr(trackFields.disc2Label)}" placeholder="π.χ. L'album Instrumental"></label></div><div class="tracklist-paste-tools"><button type="button" data-clean-tracklist>Κράτησε μόνο τίτλους</button><span data-tracklist-clean-message role="status" aria-live="polite"></span></div><textarea name="tracks_disc_2" rows="7" aria-label="Tracklist CD 2">${esc(trackFields.disc2)}</textarea></div><small class="discogs-credit">Data provided by <a href="https://www.discogs.com" target="_blank" rel="noreferrer">Discogs</a>.</small></section>
     <div class="release-content-grid"><section id="${formScope}-content" class="release-content-card release-anchor"><div class="release-card-heading"><span class="release-step">6</span><div><strong>Περιγραφή &amp; links</strong><small>Δικό σου βίντεο, περιγραφή, YouTube και Spotify.</small></div></div><label>Δικό μου βίντεο (MP4 / WebM, έως 500 MB)<input type="file" name="video_file" accept="video/mp4,video/webm,.mp4,.webm"><small>Αναπαραγωγή μέσα στο post. Για καλύτερη συμβατότητα επίλεξε MP4 με H.264 / AAC. Όλα τα αρχεία της φόρμας μαζί έως 500 MB.${r?.video_filename ? ` Υπάρχει ήδη βίντεο: ${esc(r.video_name || r.video_filename)}.` : ""}</small></label><label>Περιγραφή<textarea name="description" rows="4">${esc(r?.description || "")}</textarea></label><div class="youtube-url-row"><label>YouTube video URL<input type="url" name="youtube_url" value="${attr(r?.youtube_url || "")}" placeholder="https://www.youtube.com/watch?v=..."><small>Δέχεται κανονικό link, youtu.be, Short ή Live.</small></label></div><div class="youtube-url-row"><label>Spotify link<input type="url" name="spotify_url" value="${attr(r?.spotify_url || "")}" placeholder="https://open.spotify.com/track/..."><small>Track, album, playlist, artist, show ή episode.</small></label></div><small>Αν δεν υπάρχει ήδη αρχείο, το MP4 προετοιμάζεται αυτόματα στο background μόλις δημοσιευτεί η ανάρτηση.</small><div class="discogs-tools"><button class="youtube-fetch" type="button">Αυτόματη συμπλήρωση από YouTube</button><span class="youtube-message discogs-message" role="status" aria-live="polite"></span></div></section>
@@ -1360,6 +1373,48 @@ function isImage(file) { return file.size <= 12 * 1024 * 1024 && ["image/jpeg","
 function invalidUpload(res, file, message) { try { fs.unlinkSync(file.path); } catch {} return res.status(400).send(message); }
 async function storeDownloadObject(file) {
   const downloadName = normalizeDownloadFilename(file.originalname);
+  if (lumoBlogStorageEnabled) {
+    try {
+      const upload = await lumoBlogStorageRequest("/api/v1/blog-storage/uploads", {
+        method: "POST",
+        body: {
+          fileName: downloadName,
+          contentType: file.mimetype || "application/octet-stream",
+          byteSize: file.size,
+        },
+      });
+      let lastError;
+      for (let attempt = 1; attempt <= 4; attempt += 1) {
+        try {
+          const response = await fetch(upload.url, {
+            method: "PUT",
+            headers: {
+              "Content-Type": upload.contentType,
+              "Content-Length": String(file.size),
+            },
+            body: fs.createReadStream(file.path),
+            duplex: "half",
+            redirect: "error",
+          });
+          if (response.ok) return { key: upload.key, url: `lumo:///${upload.key}` };
+          const message = await response.text().catch(() => "");
+          lastError = new Error(`LUMO Cloud upload HTTP ${response.status}${message ? `: ${message.slice(0, 200)}` : ""}`);
+          if (response.status < 500) {
+            lastError.nonRetryable = true;
+            throw lastError;
+          }
+        } catch (error) {
+          lastError = error;
+          if (error?.nonRetryable || attempt === 4) throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250 * (2 ** (attempt - 1))));
+      }
+      throw lastError;
+    } finally {
+      try { fs.unlinkSync(file.path); } catch {}
+    }
+  }
+
   const key = `downloads/${new Date().getUTCFullYear()}/${crypto.randomUUID()}${safeExtension(downloadName)}`;
   try {
     await objectStorage.client.send(new PutObjectCommand({
@@ -1376,6 +1431,7 @@ async function storeDownloadObject(file) {
   }
   return { key, url: objectStorage.signedDownloads ? `b2://${objectStorage.bucket}/${key}` : objectUrl(objectStorage.publicUrl, key) };
 }
+
 function readYouTubeProxyHealth() {
   try {
     const parsed = JSON.parse(fs.readFileSync(youtubeProxyHealthFile, "utf8"));
@@ -1470,6 +1526,26 @@ function recordYouTubeProxyFailure(proxyUrl, failureCode) {
     lastFailureAt: Date.now(),
   };
   writeYouTubeProxyHealth();
+}
+
+function isLumoBlogStorageKey(key) {
+  return /^blog-downloads\/\d{4}\/[0-9a-f-]{36}(?:\.[a-z0-9]{1,8})?$/i.test(String(key || ""));
+}
+
+async function lumoBlogStorageRequest(route, request = {}) {
+  if (!lumoBlogStorageEnabled) throw new Error("LUMO Cloud storage is not configured");
+  const response = await fetch(`${lumoBlogStorageUrl}${route}`, {
+    method: request.method || "GET",
+    headers: {
+      Authorization: `Bearer ${lumoBlogStorageToken}`,
+      ...(request.body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: request.body ? JSON.stringify(request.body) : undefined,
+    signal: AbortSignal.timeout(15_000),
+  });
+  const body = response.status === 204 ? null : await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body?.error || `LUMO Cloud API HTTP ${response.status}`);
+  return body;
 }
 async function runYouTubeImport(jobId, release, youtubeUrl) {
   const job = youtubeImportJobs.get(jobId);
@@ -1612,6 +1688,14 @@ function removeLocalDownload(downloadUrl) {
   }
 }
 async function removeDownloadObject(key) {
+  if (isLumoBlogStorageKey(key)) {
+    try {
+      await lumoBlogStorageRequest("/api/v1/blog-storage/objects", { method: "DELETE", body: { key } });
+    } catch (error) {
+      console.warn("Unable to remove LUMO Cloud object", key, error);
+    }
+    return;
+  }
   if (!objectStorage || !key) return;
   try {
     await objectStorage.client.send(new DeleteObjectCommand({ Bucket: objectStorage.bucket, Key: key }));
@@ -1623,7 +1707,7 @@ function objectUrl(publicUrl, key) { return `${publicUrl}/${key.split("/").map(e
 function text(value) { return String(value || "").trim(); }
 function renderFooterText(value) {
   return text(value) === "Powered By Codex"
-    ? '<span class="powered-by-codex"><span class="powered-by-label">Powered By</span> <strong>Codex</strong></span>'
+    ? '<span class="powered-by-codex" style="font-weight:700;letter-spacing:.01em"><span class="powered-by-label" style="color:#7b7b83">Powered By</span> <strong style="color:#082d6b">Codex</strong></span>'
     : esc(value);
 }
 function esc(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[char])); }
