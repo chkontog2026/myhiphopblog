@@ -1,0 +1,1 @@
+ALTER TABLE `releases` ADD `youtube_url` text DEFAULT '' NOT NULL;

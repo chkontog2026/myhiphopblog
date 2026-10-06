@@ -1,0 +1,64 @@
+.post-info h4 {
+  margin: 9px 0 2px;
+  font-size: 12px;
+}
+
+.disc-tracklist {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 28px;
+  align-items: start;
+}
+
+.disc-tracklist ol {
+  margin-bottom: 0;
+}
+
+.post-info > ol,
+.disc-tracklist section {
+  overflow-x: auto;
+}
+
+.post-info li {
+  white-space: nowrap;
+}
+
+.post-info .download-link {
+  margin-top: 14px;
+}
+
+@media (min-width: 481px) and (max-width: 1024px) {
+  .post-body {
+    position: relative;
+    padding-bottom: 48px;
+  }
+
+  .post-info .download-link {
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    margin: 0;
+    transform: translateX(-50%);
+  }
+}
+
+@media (max-width: 720px) {
+  .disc-tracklist {
+    grid-template-columns: 1fr;
+  }
+
+  .disc-tracklist section + section {
+    margin-top: 8px;
+  }
+
+  .post-info .download-link {
+    display: block;
+    width: fit-content;
+  }
+}
+
+@media (max-width: 480px) {
+  .post-info .download-link {
+    margin: 14px auto 0;
+  }
+}

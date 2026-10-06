@@ -1,0 +1,51 @@
+.post-action-buttons {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  width: 100%;
+  margin-top: 24px;
+}
+
+.post-action-buttons .download-link {
+  grid-column: 2;
+  justify-self: center;
+}
+
+.post-action-buttons .post-share {
+  grid-column: 3;
+  justify-self: end;
+}
+
+.post-share {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid #aeb8ad;
+  background: #e8eee6;
+  color: #354c37;
+  cursor: pointer;
+}
+
+.post-share svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+}
+
+.post-share:hover { background: #e8eee6; }
+.post-share-status { color: #4e5e4a; font-size: 11px; }
+.post-action-buttons .post-share-status {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  margin-top: 4px;
+}
+
+@media (max-width: 480px) {
+  .post-action-buttons .post-share-status { width: auto; }
+}

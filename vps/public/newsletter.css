@@ -1,0 +1,67 @@
+.newsletter {
+  padding: 10px;
+  border: 1px solid #d5d8cf;
+  background: #f6f7f3;
+}
+
+.newsletter h2 {
+  margin: -10px -10px 9px;
+  background: #dfe5dc;
+  color: #465445;
+}
+
+.newsletter form { margin-top: 10px; }
+
+.newsletter-fields {
+  display: flex;
+  align-items: stretch;
+}
+
+.newsletter-fields input {
+  min-width: 0;
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid #aeb8ad;
+  border-right: 0;
+  border-radius: 0;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+}
+
+.newsletter-fields input:focus {
+  position: relative;
+  outline: 2px solid #657d67;
+  outline-offset: -2px;
+}
+
+.newsletter-fields button {
+  flex: none;
+  padding: 7px 9px;
+  border: 1px solid #344433;
+  border-radius: 0;
+  background: var(--green);
+  color: #fff;
+  font: bold 11px Arial, sans-serif;
+  cursor: pointer;
+}
+
+.newsletter-fields button:hover { background: #3f4f3d; }
+
+.newsletter-status {
+  margin: 7px 0 0 !important;
+  font-size: 11px;
+}
+
+.newsletter-status.success { color: #315735; }
+.newsletter-status.error { color: #8a3131; }
+
+.newsletter-honeypot {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

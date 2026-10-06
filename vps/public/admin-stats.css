@@ -1,0 +1,33 @@
+.admin-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 14px;
+  margin: 18px 0;
+}
+
+.admin-stat {
+  padding: 18px 20px;
+  border: 1px solid #cfcfc8;
+  background: #fff;
+  box-shadow: 0 1px 3px #0001;
+}
+
+.admin-stat span {
+  display: block;
+  color: #56564f;
+  font-size: 11px;
+  font-weight: bold;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.admin-stat strong {
+  display: block;
+  margin-top: 5px;
+  color: #262626;
+  font: normal 32px/1.15 Georgia, serif;
+}
+
+@media (max-width: 720px) {
+  .admin-stats { margin: 12px; }
+}

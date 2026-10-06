@@ -1,0 +1,21 @@
+.artist-sidebar button {
+  width: 100%;
+  padding: 4px 2px;
+  border: 0;
+  background: transparent;
+  color: var(--link);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.artist-sidebar button:hover,
+.artist-sidebar button:focus-visible,
+.artist-sidebar button.active {
+  color: #354c37;
+  text-decoration: underline;
+}
+
+.artist-sidebar button.active {
+  font-weight: bold;
+}

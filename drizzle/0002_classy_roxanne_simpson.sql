@@ -1,0 +1,1 @@
+ALTER TABLE `releases` ADD `release_date` text DEFAULT '' NOT NULL;

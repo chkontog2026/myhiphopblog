@@ -1,0 +1,21 @@
+.more-posts {
+  margin: 8px 0 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  text-align: center;
+}
+
+.more-posts button {
+  min-width: 130px;
+  padding: 8px 16px;
+  border: 1px solid #aeb8ad;
+  background: #e8eee6;
+  color: #354c37;
+  font: bold 12px Arial, Helvetica, sans-serif;
+  cursor: pointer;
+}
+
+.more-posts button:hover,
+.more-posts button:focus-visible {
+  background: #dce6d9;
+}

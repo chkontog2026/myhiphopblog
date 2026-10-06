@@ -1,0 +1,33 @@
+.admin-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  margin: 24px 0 0;
+  font-weight: bold;
+}
+
+.admin-pagination a,
+.admin-pagination .disabled {
+  min-width: 120px;
+  padding: 8px 12px;
+  border: 1px solid #bfc4bb;
+  background: #fff;
+  text-align: center;
+}
+
+.admin-pagination a {
+  color: #3f5742;
+}
+
+.admin-pagination .disabled {
+  color: #aaa;
+}
+
+@media (max-width: 560px) {
+  .admin-pagination {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 0 12px;
+  }
+}
