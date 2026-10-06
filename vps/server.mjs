@@ -9,6 +9,7 @@ import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } fro
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import express from "express";
 import multer from "multer";
+import { isUploadedVideo, videoFilePath } from "./owned-video.mjs";
 import { discogsGreekAccentVariants, greeklishDiscogsSearchTerms, normalizeDiscogsSearchText } from "./discogs-lookup.mjs";
 import { downloadContentDisposition, normalizeDownloadFilename } from "./download-filename.mjs";
 import { googleAnalyticsHead, normalizeGoogleAnalyticsId } from "./google-analytics.mjs";
@@ -22,6 +23,9 @@ import { parseProxyProbeOutput, parseProxyUrls, proxyIdentity, rankProxyUrls, sa
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || path.join(root, "data");
 const uploadDir = path.join(dataDir, "uploads");
+const videoDir = path.join(dataDir, "videos");
+const videoPreviewDir = path.join(dataDir, "video-previews");
+const videoPreviews = new Map();
 const port = Number(process.env.PORT || 3020);
 const host = process.env.HOST || "127.0.0.1";
 const adminPassword = process.env.ADMIN_PASSWORD || "";
@@ -79,6 +83,12 @@ if (adminPassword.length < 11 || sessionSecret.length < 32) {
 }
 
 fs.mkdirSync(uploadDir, { recursive: true });
+fs.mkdirSync(videoDir, { recursive: true });
+fs.mkdirSync(videoPreviewDir, { recursive: true });
+for (const filename of fs.readdirSync(videoPreviewDir)) {
+  const target = videoFilePath(videoPreviewDir, filename);
+  if (target && Date.now() - fs.statSync(target).mtimeMs > 15 * 60_000) fs.rmSync(target, { force: true });
+}
 const db = new DatabaseSync(path.join(dataDir, "blog.sqlite"));
 db.exec("PRAGMA journal_mode = WAL");
 db.exec("PRAGMA foreign_keys = ON");
@@ -176,6 +186,12 @@ if (!db.prepare("PRAGMA table_info(releases)").all().some((column) => column.nam
 
 seedDatabase();
 
+for (const column of ["video_filename", "video_name"]) {
+  if (!db.prepare("PRAGMA table_info(releases)").all().some((entry) => entry.name === column)) {
+    db.exec(`ALTER TABLE releases ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+  }
+}
+
 const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
@@ -196,13 +212,14 @@ app.use(express.static(path.join(root, "public"), { maxAge: "1h", etag: true }))
 app.use("/uploads", express.static(uploadDir, { maxAge: "30d", immutable: true }));
 
 const storage = multer.diskStorage({
-  destination: (_req, _file, callback) => callback(null, uploadDir),
+  destination: (req, file, callback) => callback(null, file.fieldname === "video_file" ? (req.path.endsWith("/preview") ? videoPreviewDir : videoDir) : uploadDir),
   filename: (_req, file, callback) => callback(null, `${crypto.randomUUID()}${safeExtension(normalizeDownloadFilename(file.originalname))}`),
 });
-const upload = multer({ storage, limits: { fileSize: 500 * 1024 * 1024, files: 2 } });
+const upload = multer({ storage, limits: { fileSize: 500 * 1024 * 1024, files: 3 } });
 const uploadFields = upload.fields([
   { name: "cover", maxCount: 1 },
   { name: "download_file", maxCount: 1 },
+  { name: "video_file", maxCount: 1 },
   { name: "header_image", maxCount: 1 },
 ]);
 
@@ -234,6 +251,16 @@ app.get("/posts/:slug", (req, res) => {
   issuePageViewIntent(req, res);
   return res.send(renderBlog("", null, release));
 });
+app.get("/videos/:id", (req, res, next) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(404).send("Not found");
+  const release = db.prepare("SELECT video_filename, published FROM releases WHERE id=?").get(id);
+  if (!release || (!release.published && !isAdmin(req))) return res.status(404).send("Not found");
+  const filePath = videoFilePath(videoDir, release.video_filename);
+  if (!filePath || !fs.existsSync(filePath)) return res.status(404).send("Not found");
+  res.setHeader("Cache-Control", "private, no-store");
+  return res.sendFile(filePath, (error) => { if (error) next(error); });
+});
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.post("/analytics/page-view", (req, res) => {
   res.setHeader("Cache-Control", "private, no-store");
@@ -257,7 +284,7 @@ app.post("/newsletter", (req, res) => {
 app.post("/downloads/:id/intent", (req, res) => {
   const id = Number(req.params.id);
   const available = Number.isSafeInteger(id) && id > 0
-    ? db.prepare("SELECT 1 FROM releases WHERE id = ? AND published = 1 AND download_enabled = 1 AND (download_url <> '' OR youtube_url <> '')").get(id)
+    ? db.prepare("SELECT 1 FROM releases WHERE id = ? AND published = 1 AND download_enabled = 1 AND (download_url <> '' OR youtube_url <> '' OR video_filename <> '')").get(id)
     : null;
   if (!available) return res.status(404).send("Not found");
   if (!shouldCountPageView(req) || !isSameSiteDownloadIntent(req)) return res.status(403).send("Download unavailable");
@@ -274,18 +301,24 @@ app.post("/downloads/:id/intent", (req, res) => {
 app.head("/downloads/:id", (req, res) => {
   const id = Number(req.params.id);
   const available = Number.isSafeInteger(id) && id > 0
-    ? db.prepare("SELECT 1 FROM releases WHERE id = ? AND published = 1 AND download_enabled = 1 AND (download_url <> '' OR youtube_url <> '')").get(id)
+    ? db.prepare("SELECT 1 FROM releases WHERE id = ? AND published = 1 AND download_enabled = 1 AND (download_url <> '' OR youtube_url <> '' OR video_filename <> '')").get(id)
     : null;
   return available ? res.sendStatus(204) : res.sendStatus(404);
 });
 app.get("/downloads/:id", async (req, res, next) => {
   const id = Number(req.params.id);
   if (!Number.isSafeInteger(id) || id < 1) return res.status(404).send("Not found");
-  const release = db.prepare("SELECT id, artist, title, youtube_url, download_url, download_key, download_name FROM releases WHERE id = ? AND published = 1 AND download_enabled = 1").get(id);
+  const release = db.prepare("SELECT id, artist, title, youtube_url, download_url, download_key, download_name, video_filename, video_name FROM releases WHERE id = ? AND published = 1 AND download_enabled = 1").get(id);
   if (!release) return res.status(404).send("Not found");
   if (!shouldCountPageView(req) || !validDownloadIntent(id, req)) {
     res.setHeader("Cache-Control", "private, no-store");
     return res.status(200).send(renderDownloadConfirmation(release));
+  }
+  if (!release.download_url && release.video_filename) {
+    const filePath = videoFilePath(videoDir, release.video_filename);
+    if (!filePath || !fs.existsSync(filePath)) return res.status(404).send("Not found");
+    recordUniqueDownload(id, req);
+    return res.download(filePath, normalizeDownloadFilename(release.video_name || release.video_filename));
   }
   if (!release.download_url) {
     const youtubeUrl = normalizeYouTubeUrl(release.youtube_url);
@@ -411,9 +444,16 @@ app.use("/admin", (req, res, next) => {
   next();
 });
 
+app.get("/admin/video-preview/:filename", (req, res, next) => {
+  const filePath = videoPreviews.get(req.params.filename);
+  if (!filePath) return res.status(404).send("Not found");
+  res.setHeader("Cache-Control", "private, no-store");
+  return res.sendFile(filePath, (error) => { if (error) next(error); });
+});
 app.get("/admin", (req, res) => res.send(renderAdmin(req)));
 app.post("/admin/releases/preview", uploadFields, (req, res, next) => {
   const previewFiles = Object.values(req.files || {}).flat();
+  let retainedVideo = null;
   try {
     if (!validCsrf(req)) return res.status(403).send("Invalid request");
     const id = Number(req.body.id || 0);
@@ -427,6 +467,8 @@ app.post("/admin/releases/preview", uploadFields, (req, res, next) => {
     const rawSpotifyUrl = text(req.body.spotify_url);
     const spotifyUrl = normalizeSpotifyUrl(rawSpotifyUrl);
     if (rawSpotifyUrl && !spotifyUrl) return res.status(400).send("Το Spotify URL δεν είναι έγκυρο link track, album, playlist, artist, show ή episode.");
+    const videoFile = req.files?.video_file?.[0];
+    if (videoFile && !isUploadedVideo(videoFile)) return res.status(400).send("Το βίντεο πρέπει να είναι έγκυρο αρχείο MP4 ή WebM.");
     const artist = text(req.body.artist);
     const title = text(req.body.title);
     const publishDate = text(req.body.publish_date) || dateInTimeZone(new Date(), siteTimeZone);
@@ -445,6 +487,8 @@ app.post("/admin/releases/preview", uploadFields, (req, res, next) => {
       genre: text(req.body.genre) || "Hip Hop",
       format: text(req.body.format) || "MP3",
       description: text(req.body.description),
+      video_filename: req.body.remove_video === "1" ? "" : videoFile?.filename || existing?.video_filename || "",
+      video_preview_url: videoFile && req.body.remove_video !== "1" ? `/admin/video-preview/${videoFile.filename}` : "",
       youtube_url: youtubeUrl,
       spotify_url: spotifyUrl,
       cover_url: coverUrl,
@@ -455,12 +499,21 @@ app.post("/admin/releases/preview", uploadFields, (req, res, next) => {
       published: Number(existing?.published || 0),
       tracks: combineTracklistDiscs(req.body.tracks, req.body.has_second_disc === "1" ? req.body.tracks_disc_2 : "", req.body.disc_1_label, req.body.disc_2_label),
     };
+    const html = renderBlog("", previewRelease);
+    if (previewRelease.video_preview_url) {
+      retainedVideo = videoFile;
+      videoPreviews.set(videoFile.filename, videoFile.path);
+      setTimeout(() => {
+        videoPreviews.delete(videoFile.filename);
+        try { fs.rmSync(videoFile.path, { force: true }); } catch (error) { console.warn("Unable to remove video preview", error.message); }
+      }, 15 * 60_000).unref();
+    }
     res.setHeader("Cache-Control", "private, no-store");
-    return res.send(renderBlog("", previewRelease));
+    return res.send(html);
   } catch (error) {
     next(error);
   } finally {
-    previewFiles.forEach((file) => { try { fs.unlinkSync(file.path); } catch {} });
+    previewFiles.filter((file) => file !== retainedVideo).forEach((file) => { try { fs.unlinkSync(file.path); } catch {} });
   }
 });
 
@@ -629,13 +682,22 @@ app.post("/admin/discogs/tracklist", async (req, res) => {
 });
 
 app.post("/admin/releases/save", uploadFields, async (req, res, next) => {
+  const videoFile = req.files?.video_file?.[0];
+  let videoSaved = false;
+  const reject = (status, message) => {
+    if (videoFile) fs.rmSync(videoFile.path, { force: true });
+    return res.status(status).send(message);
+  };
   try {
-    if (!validCsrf(req)) return res.status(403).send("Invalid request");
+    if (!validCsrf(req)) return reject(403, "Invalid request");
     const id = Number(req.body.id || 0);
     const existing = id ? db.prepare("SELECT * FROM releases WHERE id=?").get(id) : null;
-    if (id && !existing) return res.status(404).send("Post not found");
+    if (id && !existing) return reject(404, "Post not found");
     const coverFile = req.files?.cover?.[0];
     const downloadFile = req.files?.download_file?.[0];
+    if (videoFile && !isUploadedVideo(videoFile)) return reject(400, "Το βίντεο πρέπει να είναι έγκυρο αρχείο MP4 ή WebM.");
+    const videoFilename = req.body.remove_video === "1" ? "" : videoFile?.filename || existing?.video_filename || "";
+    const videoName = req.body.remove_video === "1" ? "" : videoFile ? normalizeDownloadFilename(videoFile.originalname) : existing?.video_name || "";
     if (coverFile && !isImage(coverFile)) return invalidUpload(res, coverFile, "Το εξώφυλλο δεν είναι έγκυρη εικόνα.");
     const externalCoverUrl = text(req.body.cover_url);
     const discogsCoverUrl = text(req.body.discogs_cover_url);
@@ -679,27 +741,27 @@ app.post("/admin/releases/save", uploadFields, async (req, res, next) => {
         : req.body.published === "1" ? 1 : 0;
     const rawYouTubeUrl = text(req.body.youtube_url);
     const youtubeUrl = normalizeYouTubeUrl(rawYouTubeUrl);
-    if (rawYouTubeUrl && !youtubeUrl) return res.status(400).send("Το YouTube URL δεν είναι έγκυρο link βίντεο.");
+    if (rawYouTubeUrl && !youtubeUrl) return reject(400, "Το YouTube URL δεν είναι έγκυρο link βίντεο.");
     const rawSpotifyUrl = text(req.body.spotify_url);
     const spotifyUrl = normalizeSpotifyUrl(rawSpotifyUrl);
-    if (rawSpotifyUrl && !spotifyUrl) return res.status(400).send("Το Spotify URL δεν είναι έγκυρο link track, album, playlist, artist, show ή episode.");
+    if (rawSpotifyUrl && !spotifyUrl) return reject(400, "Το Spotify URL δεν είναι έγκυρο link track, album, playlist, artist, show ή episode.");
     const values = {
       artist: text(req.body.artist), title: text(req.body.title), publishDate: text(req.body.publish_date) || dateInTimeZone(new Date(), siteTimeZone),
       releaseDate: releaseYear(req.body.release_date),
       genre: text(req.body.genre) || "Hip Hop", format: text(req.body.format) || "MP3", description: text(req.body.description),
-      youtubeUrl, spotifyUrl, coverUrl, downloadUrl, downloadKey, downloadName, downloadEnabled: req.body.download_enabled === "1" ? 1 : 0,
+      videoFilename, videoName, youtubeUrl, spotifyUrl, coverUrl, downloadUrl, downloadKey, downloadName, downloadEnabled: req.body.download_enabled === "1" ? 1 : 0,
       position: Number(req.body.position || 0), published,
     };
-    if (!values.artist || !values.title || !values.publishDate) return res.status(400).send("Artist, title and date are required");
+    if (!values.artist || !values.title || !values.publishDate) return reject(400, "Artist, title and date are required");
 
     const save = () => transaction(() => {
       let releaseId = id;
       if (id) {
-        db.prepare(`UPDATE releases SET artist=?,title=?,publish_date=?,release_date=?,genre=?,format=?,description=?,youtube_url=?,spotify_url=?,cover_url=?,download_url=?,download_key=?,download_name=?,download_enabled=?,position=?,published=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
-          .run(values.artist, values.title, values.publishDate, values.releaseDate, values.genre, values.format, values.description, values.youtubeUrl, values.spotifyUrl, values.coverUrl, values.downloadUrl, values.downloadKey, values.downloadName, values.downloadEnabled, values.position, values.published, id);
+        db.prepare(`UPDATE releases SET artist=?,title=?,publish_date=?,release_date=?,genre=?,format=?,description=?,video_filename=?,video_name=?,youtube_url=?,spotify_url=?,cover_url=?,download_url=?,download_key=?,download_name=?,download_enabled=?,position=?,published=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+          .run(values.artist, values.title, values.publishDate, values.releaseDate, values.genre, values.format, values.description, values.videoFilename, values.videoName, values.youtubeUrl, values.spotifyUrl, values.coverUrl, values.downloadUrl, values.downloadKey, values.downloadName, values.downloadEnabled, values.position, values.published, id);
       } else {
-        const result = db.prepare(`INSERT INTO releases (slug,artist,title,publish_date,release_date,genre,format,description,youtube_url,spotify_url,cover_url,download_url,download_key,download_name,download_enabled,position,published) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-          .run(makeSlug(values.artist, values.title), values.artist, values.title, values.publishDate, values.releaseDate, values.genre, values.format, values.description, values.youtubeUrl, values.spotifyUrl, values.coverUrl, values.downloadUrl, values.downloadKey, values.downloadName, values.downloadEnabled, values.position, values.published);
+        const result = db.prepare(`INSERT INTO releases (slug,artist,title,publish_date,release_date,genre,format,description,video_filename,video_name,youtube_url,spotify_url,cover_url,download_url,download_key,download_name,download_enabled,position,published) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(makeSlug(values.artist, values.title), values.artist, values.title, values.publishDate, values.releaseDate, values.genre, values.format, values.description, values.videoFilename, values.videoName, values.youtubeUrl, values.spotifyUrl, values.coverUrl, values.downloadUrl, values.downloadKey, values.downloadName, values.downloadEnabled, values.position, values.published);
         releaseId = Number(result.lastInsertRowid);
       }
       db.prepare("DELETE FROM tracks WHERE release_id=?").run(releaseId);
@@ -709,8 +771,10 @@ app.post("/admin/releases/save", uploadFields, async (req, res, next) => {
       return releaseId;
     });
     const releaseId = save();
+    videoSaved = Boolean(videoFile && values.videoFilename === videoFile.filename);
+    if (existing?.video_filename && existing.video_filename !== values.videoFilename) removeVideo(existing.video_filename);
     if (existing?.download_key && existing.download_key !== values.downloadKey) await removeDownloadObject(existing.download_key);
-    if (publishAction === "publish" && values.published && values.downloadEnabled && values.youtubeUrl && !values.downloadUrl) {
+    if (publishAction === "publish" && values.published && values.downloadEnabled && values.youtubeUrl && !values.downloadUrl && !values.videoFilename) {
       const release = db.prepare("SELECT id, artist, title, youtube_url, download_url, download_key FROM releases WHERE id = ?").get(releaseId);
       enqueueYouTubeImport(release, values.youtubeUrl, { message: "Αυτόματη προετοιμασία μετά τη δημοσίευση…" });
     }
@@ -719,6 +783,8 @@ app.post("/admin/releases/save", uploadFields, async (req, res, next) => {
     res.redirect(`/admin?ok=post&page=${adminPage}&edit=${releaseId}#release-actions-${releaseId}`);
   } catch (error) {
     next(error);
+  } finally {
+    if (videoFile && !videoSaved) fs.rmSync(videoFile.path, { force: true });
   }
 });
 
@@ -726,9 +792,10 @@ app.post("/admin/releases/delete", async (req, res, next) => {
   try {
     if (!validCsrf(req)) return res.status(403).send("Invalid request");
     const id = Number(req.body.id || 0);
-    const release = db.prepare("SELECT download_key FROM releases WHERE id=?").get(id);
+    const release = db.prepare("SELECT download_key, video_filename FROM releases WHERE id=?").get(id);
     db.prepare("DELETE FROM releases WHERE id=?").run(id);
     if (release?.download_key) await removeDownloadObject(release.download_key);
+    if (release?.video_filename) removeVideo(release.video_filename);
     res.redirect("/admin?ok=deleted");
   } catch (error) {
     next(error);
@@ -791,22 +858,23 @@ function renderBlog(newsletterStatus = "", previewRelease = null, socialRelease 
   const headerStyle = `background-color:${safeColor(s.header_color)};${s.header_image_url ? `background-image:linear-gradient(rgba(20,20,20,.25),rgba(20,20,20,.25)),url('${attr(s.header_image_url)}')` : ""}`;
   const posts = releases.map((r) => {
     const year = releaseYear(r.release_date);
+    const ownedVideoUrl = r.video_filename ? r.video_preview_url || `/videos/${r.id}?v=${encodeURIComponent(r.video_filename)}` : "";
     const videoUrl = youtubeEmbedUrl(r.youtube_url);
     const spotifyUrl = spotifyEmbedUrl(r.spotify_url);
     const spotifyType = spotifyResource(r.spotify_url)?.type || "Spotify";
     const hasReleaseDetails = Boolean(r.cover_url || r.tracks.length);
     const postPath = `/posts/${encodeURIComponent(r.slug)}`;
     const shareButton = `<button class="post-share" type="button" data-share-url="${attr(`${siteUrl}${postPath}#${encodeURIComponent(r.slug)}`)}" data-share-title="${attr(`${r.artist} — ${r.title}${year ? ` (${year})` : ""}`)}" aria-label="Κοινοποίηση ανάρτησης" title="Κοινοποίηση"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4"></path></svg></button><span class="post-share-status" role="status" aria-live="polite"></span>`;
-    const hasDownload = Boolean(videoUrl || r.download_url);
+    const hasDownload = Boolean(ownedVideoUrl || videoUrl || r.download_url);
     const downloadControl = hasDownload
       ? `<form class="download-intent-form" method="post" action="/downloads/${r.id}/intent"><button class="download-link" type="submit">Download</button></form>`
       : `<a class="download-link" href="${attr(`mailto:${s.contact_email}?subject=Download — ${r.title}`)}">Download</a>`;
     const actionButtons = r.download_enabled ? `<div class="post-action-buttons">${downloadControl}${shareButton}</div>` : "";
-    return `<article class="post${!hasReleaseDetails && (videoUrl || spotifyUrl) ? " video-only-post" : ""}" id="${attr(r.slug)}" data-artist="${attr(r.artist)}">
+    return `<article class="post${!hasReleaseDetails && (ownedVideoUrl || videoUrl || spotifyUrl) ? " video-only-post" : ""}" id="${attr(r.slug)}" data-artist="${attr(r.artist)}">
     <p class="post-date">${esc(formatDate(r.publish_date))}</p><h2>${esc(r.artist)} — ${esc(r.title)}${year ? ` (${esc(year)})` : ""}</h2>
     ${hasReleaseDetails ? `<div class="post-body">${r.cover_url ? `<a class="cover-zoom" href="${attr(r.cover_url)}" aria-label="Μεγέθυνση εξωφύλλου του ${attr(r.title)}"><img src="${attr(r.cover_url)}" alt="Εξώφυλλο του ${attr(r.title)}"></a>` : `<div class="cover-placeholder">Χωρίς εξώφυλλο</div>`}
-      <div class="post-info"><p class="post-note">${esc(r.description)}</p><h3>Tracklist</h3>${renderTracklist(r.tracks)}</div></div>${videoUrl || spotifyUrl ? "" : actionButtons}` : r.description ? `<p class="post-note">${esc(r.description)}</p>` : ""}${videoUrl ? `<div class="post-video-block"><div class="post-video"><iframe src="${attr(videoUrl)}" title="${attr(`${r.artist} — ${r.title} στο YouTube`)}" loading="lazy" referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe></div>${spotifyUrl ? "" : actionButtons}</div>` : ""}${spotifyUrl ? `<div class="post-spotify-block"><div class="post-spotify"><iframe src="${attr(spotifyUrl)}" title="${attr(`${r.artist} — ${r.title} στο Spotify (${spotifyType})`)}" loading="lazy" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe></div><a class="spotify-full-link" href="${attr(r.spotify_url)}" target="_blank" rel="noopener noreferrer">Άκουσε το ολόκληρο στο Spotify</a>${videoUrl ? "" : actionButtons}</div>` : ""}
-    <footer class="post-footer"><span>Αναρτήθηκε από <b>${esc(s.blog_title)}</b></span></footer></article>`;
+      <div class="post-info"><p class="post-note">${esc(r.description)}</p><h3>Tracklist</h3>${renderTracklist(r.tracks)}</div></div>` : r.description ? `<p class="post-note">${esc(r.description)}</p>` : ""}${ownedVideoUrl ? `<div class="post-video-block"><div class="post-video"><video src="${attr(ownedVideoUrl)}" controls playsinline preload="metadata"${r.cover_url ? ` poster="${attr(r.cover_url)}"` : ""} aria-label="${attr(`${r.artist} — ${r.title}`)}">Ο browser σου δεν υποστηρίζει αναπαραγωγή βίντεο.</video></div></div>` : ""}${videoUrl ? `<div class="post-video-block"><div class="post-video"><iframe src="${attr(videoUrl)}" title="${attr(`${r.artist} — ${r.title} στο YouTube`)}" loading="lazy" referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe></div></div>` : ""}${spotifyUrl ? `<div class="post-spotify-block"><div class="post-spotify"><iframe src="${attr(spotifyUrl)}" title="${attr(`${r.artist} — ${r.title} στο Spotify (${spotifyType})`)}" loading="lazy" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe></div><a class="spotify-full-link" href="${attr(r.spotify_url)}" target="_blank" rel="noopener noreferrer">Άκουσε το ολόκληρο στο Spotify</a></div>` : ""}
+    ${actionButtons}<footer class="post-footer"><span>Αναρτήθηκε από <b>${esc(s.blog_title)}</b></span></footer></article>`;
   }).join("");
   const previewBanner = previewRelease ? `<div class="preview-banner" role="status"><strong>Preview</strong><span>Η προεπισκόπηση δεν αλλάζει τη δημοσίευση.</span><a href="/admin?edit=${previewRelease.id || "new"}">Επιστροφή στην επεξεργασία</a></div>` : "";
   const previewHead = previewRelease ? `<style>.preview-banner{position:sticky;top:0;z-index:1000;display:flex;align-items:center;justify-content:center;gap:12px;padding:10px 16px;border-bottom:1px solid #2f3c2d;background:#4e5e4a;color:#fff;font:14px/1.35 Arial,sans-serif}.preview-banner strong{font-size:15px}.preview-banner a{color:#fff;font-weight:700;text-decoration:underline}@media(max-width:600px){.preview-banner{flex-wrap:wrap;gap:5px 10px;padding:8px 10px;font-size:12px}}</style>` : "";
@@ -905,7 +973,7 @@ function renderAdmin(req, error = "") {
       <div class="form-grid"><label>Τίτλος «Σχετικά»<input name="about_title" value="${attr(s.about_title)}"></label><label>Τίτλος κατηγοριών<input name="categories_title" value="${attr(s.categories_title)}"></label><label>Τίτλος αρχείου<input name="archive_title" value="${attr(s.archive_title)}"></label><label>Τίτλος links<input name="links_title" value="${attr(s.links_title)}"></label></div><label>Κείμενο «Σχετικά»<textarea name="about_text" rows="4">${esc(s.about_text)}</textarea></label>
       <div class="form-grid four"><label>Αρχική<input name="home_label" value="${attr(s.home_label)}"></label><label>Κυκλοφορίες<input name="releases_label" value="${attr(s.releases_label)}"></label><label>Σχετικά<input name="about_label" value="${attr(s.about_label)}"></label><label>Επικοινωνία<input name="contact_label" value="${attr(s.contact_label)}"></label></div>
       <div class="form-grid"><label>Email<input type="email" name="contact_email" value="${attr(s.contact_email)}"></label><label>Instagram URL<input type="url" name="instagram_url" value="${attr(s.instagram_url)}"></label><label>SoundCloud URL<input type="url" name="soundcloud_url" value="${attr(s.soundcloud_url)}"></label><label>Footer<input name="footer_text" value="${attr(s.footer_text)}"></label></div><button class="primary" type="submit">Αποθήκευση ρυθμίσεων</button></form></details></div>
-    <h2 class="list-title">Αναρτήσεις (${releases.length})</h2>${pageReleases.map((r) => { const listCover = r.cover_url || youtubeThumbnailUrl(r.youtube_url); return `<details id="release-${r.id}" class="admin-card release-row"${Number(req.query.edit) === r.id ? " open" : ""}><summary>${listCover ? `<img src="${attr(listCover)}" alt="">` : ""}<span><b>${esc(r.artist)} — ${esc(r.title)}</b><small>${esc(r.publish_date)} · ${esc(r.genre)} · ${r.published ? "Δημοσιευμένη" : "Πρόχειρο"} · ${formatDownloadCount(r.download_count)}</small></span><button class="release-delete-button" type="button" data-delete-form="delete-release-${r.id}" aria-label="Διαγραφή της ανάρτησης ${attr(`${r.artist} — ${r.title}`)}">Διαγραφή</button></summary>${releaseForm(r, csrf, currentPage)}<form id="delete-release-${r.id}" class="delete-form" method="post" action="/admin/releases/delete" hidden><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${r.id}"></form></details>`; }).join("")}${pagination}</main>`, null, `<link rel="stylesheet" href="/admin-progress.css?v=3"><link rel="stylesheet" href="/admin-discogs.css?v=18"><link rel="stylesheet" href="/admin-stats.css?v=1"><link rel="stylesheet" href="/admin-pagination.css?v=1"><link rel="stylesheet" href="/playlist-metadata.css?v=2"><script src="/admin-upload.js?v=8" defer></script><script src="/admin-discogs.js?v=8" defer></script><script type="module" src="/tracklist-paste.mjs?v=1"></script><script type="module" src="/playlist-metadata.mjs?v=2"></script><script src="/admin-youtube.js?v=3" defer></script>`);
+    <h2 class="list-title">Αναρτήσεις (${releases.length})</h2>${pageReleases.map((r) => { const listCover = r.cover_url || youtubeThumbnailUrl(r.youtube_url); return `<details id="release-${r.id}" class="admin-card release-row"${Number(req.query.edit) === r.id ? " open" : ""}><summary>${listCover ? `<img src="${attr(listCover)}" alt="">` : ""}<span><b>${esc(r.artist)} — ${esc(r.title)}</b><small>${esc(r.publish_date)} · ${esc(r.genre)} · ${r.published ? "Δημοσιευμένη" : "Πρόχειρο"} · ${formatDownloadCount(r.download_count)}</small></span><button class="release-delete-button" type="button" data-delete-form="delete-release-${r.id}" aria-label="Διαγραφή της ανάρτησης ${attr(`${r.artist} — ${r.title}`)}">Διαγραφή</button></summary>${releaseForm(r, csrf, currentPage)}<form id="delete-release-${r.id}" class="delete-form" method="post" action="/admin/releases/delete" hidden><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${r.id}"></form></details>`; }).join("")}${pagination}</main>`, null, `<link rel="stylesheet" href="/admin-progress.css?v=3"><link rel="stylesheet" href="/admin-discogs.css?v=18"><link rel="stylesheet" href="/admin-stats.css?v=1"><link rel="stylesheet" href="/admin-pagination.css?v=1"><link rel="stylesheet" href="/playlist-metadata.css?v=2"><script src="/admin-upload.js?v=9" defer></script><script src="/admin-discogs.js?v=8" defer></script><script type="module" src="/tracklist-paste.mjs?v=1"></script><script type="module" src="/playlist-metadata.mjs?v=2"></script><script src="/admin-youtube.js?v=3" defer></script>`);
 }
 
 function releaseForm(r, csrf, adminPage = 1) {
@@ -916,12 +984,12 @@ function releaseForm(r, csrf, adminPage = 1) {
   const formScope = `release-form-${r?.id || "new"}`;
   return `<form class="release-form" method="post" action="/admin/releases/save" enctype="multipart/form-data" data-has-cover="${r?.cover_url ? "1" : "0"}"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="id" value="${r?.id || ""}"><input type="hidden" name="admin_page" value="${adminPage}"><input type="hidden" name="discogs_cover_url" value="">
     <nav class="release-form-nav" aria-label="Γρήγορη μετάβαση και ενέργειες φόρμας"><div class="release-form-nav-links"><span>Μετάβαση:</span><a href="#${formScope}-basics">Βασικά</a><a href="#${formScope}-media">Discogs &amp; εξώφυλλο</a><a href="#${formScope}-tracks">Tracklist</a><a href="#${formScope}-content">Περιγραφή</a><a href="#${formScope}-extras">Προαιρετικά</a></div><div class="release-form-nav-actions"><button class="release-preview" type="submit" formaction="/admin/releases/preview" formtarget="_blank">Preview</button><button class="release-save" type="submit" name="publish_action" value="save">Αποθήκευση Ανάρτησης</button><button class="primary release-publish" type="submit" name="publish_action" value="publish">Δημοσίευση</button></div></nav>
-    <div id="${formScope}-basics" class="release-editor-top release-anchor"><section class="release-primary-upload"><div class="release-card-heading"><span class="release-step">1</span><div><strong>Αρχείο μουσικής</strong><small>Επίλεξέ το πρώτο για αυτόματη αναγνώριση.</small></div></div><label>Μουσική / ZIP (έως 500 MB)${objectStorage ? ` — ${objectStorage.provider}` : ""}<input type="file" name="download_file" accept="audio/*,.zip,.rar,.7z,.flac"></label><label class="youtube-download-enabled"><input type="checkbox" name="download_enabled" value="1" ${!r || r.download_enabled ? "checked" : ""}> Ενεργό Download στο post</label><details class="release-optional"${downloadExternal ? " open" : ""}><summary>Εναλλακτικό download URL</summary><label>Download URL<input type="url" name="download_url" value="${attr(downloadExternal)}"></label></details></section><section class="release-essential-card"><div class="release-card-heading"><span class="release-step">2</span><div><strong>Βασικά στοιχεία</strong><small>Καλλιτέχνης, τίτλος και χρονολογία.</small></div></div><div class="form-grid"><label>Καλλιτέχνης<input name="artist" value="${attr(r?.artist || "")}" required></label><label>Τίτλος<input name="title" value="${attr(r?.title || "")}" required></label><label>Χρονολογία κυκλοφορίας<input type="number" name="release_date" min="1900" max="2099" step="1" placeholder="π.χ. 1999" value="${attr(releaseYear(r?.release_date))}"></label><label>Ημερομηνία ανάρτησης<input type="date" name="publish_date" value="${attr(r?.publish_date || dateInTimeZone(new Date(), siteTimeZone))}" required></label></div></section></div>
+    <div id="${formScope}-basics" class="release-editor-top release-anchor"><section class="release-primary-upload"><div class="release-card-heading"><span class="release-step">1</span><div><strong>Αρχείο μουσικής</strong><small>Επίλεξέ το πρώτο για αυτόματη αναγνώριση.</small></div></div><label>Μουσική / ZIP (έως 500 MB)${objectStorage ? ` — ${objectStorage.provider}` : ""}<input type="file" name="download_file" accept="audio/*,.zip,.rar,.7z,.flac"></label><label class="youtube-download-enabled"><input type="checkbox" name="download_enabled" value="1" ${!r || r.download_enabled ? "checked" : ""}> Ενεργό Download στο post</label><small>Χωρίς ξεχωριστό αρχείο μουσικής ή download URL, το Download κατεβάζει το δικό σου βίντεο.</small><details class="release-optional"${downloadExternal ? " open" : ""}><summary>Εναλλακτικό download URL</summary><label>Download URL<input type="url" name="download_url" value="${attr(downloadExternal)}"></label></details></section><section class="release-essential-card"><div class="release-card-heading"><span class="release-step">2</span><div><strong>Βασικά στοιχεία</strong><small>Καλλιτέχνης, τίτλος και χρονολογία.</small></div></div><div class="form-grid"><label>Καλλιτέχνης<input name="artist" value="${attr(r?.artist || "")}" required></label><label>Τίτλος<input name="title" value="${attr(r?.title || "")}" required></label><label>Χρονολογία κυκλοφορίας<input type="number" name="release_date" min="1900" max="2099" step="1" placeholder="π.χ. 1999" value="${attr(releaseYear(r?.release_date))}"></label><label>Ημερομηνία ανάρτησης<input type="date" name="publish_date" value="${attr(r?.publish_date || dateInTimeZone(new Date(), siteTimeZone))}" required></label></div></section></div>
     <div id="${formScope}-media" class="release-media-grid release-anchor"><div class="release-discogs-panel"><div class="release-card-heading"><span class="release-step">3</span><div><strong>Συμπλήρωση από Discogs</strong><small>Στοιχεία, εξώφυλλο και αριθμημένο tracklist.</small></div></div><button class="discogs-fetch" type="button" ${getDiscogsToken() ? "" : "disabled"}>Εύρεση στο Discogs</button><span class="discogs-message" role="status" aria-live="polite"></span></div><section class="release-content-card release-cover-card"><div class="release-card-heading"><span class="release-step">4</span><div><strong>Εξώφυλλο</strong><small>Ανέβασε εικόνα ή χρησιμοποίησε URL εξωφύλλου.</small></div></div><div class="form-grid uploads"><label>Αρχείο εικόνας<input type="file" name="cover" accept="image/*"></label><label>ή URL εξωφύλλου<input type="url" name="cover_url" value="${attr(coverExternal)}"></label></div></section></div>
     <section id="${formScope}-tracks" class="release-tracklist-editor release-anchor"><div class="release-card-heading"><span class="release-step">5</span><div><strong>Tracklist</strong><small>Επικόλλησε λίστα από Discogs και πάτησε «Κράτησε μόνο τίτλους».</small></div></div><div class="disc-editor disc-editor-primary"><div class="disc-editor-heading"><strong>CD 1</strong><label>Προαιρετικός τίτλος<input name="disc_1_label" value="${attr(trackFields.disc1Label)}" placeholder="π.χ. L'album Original"></label></div><div class="tracklist-paste-tools"><button type="button" data-clean-tracklist>Κράτησε μόνο τίτλους</button><span data-tracklist-clean-message role="status" aria-live="polite"></span></div><textarea name="tracks" rows="7" aria-label="Tracklist CD 1">${esc(trackFields.disc1)}</textarea></div><label class="second-disc-toggle"><input type="checkbox" name="has_second_disc" value="1" ${hasSecondDisc ? "checked" : ""}> Ο δίσκος έχει και 2ο CD</label><div class="disc-editor disc-editor-secondary" ${hasSecondDisc ? "" : "hidden"}><div class="disc-editor-heading"><strong>CD 2</strong><label>Προαιρετικός τίτλος<input name="disc_2_label" value="${attr(trackFields.disc2Label)}" placeholder="π.χ. L'album Instrumental"></label></div><div class="tracklist-paste-tools"><button type="button" data-clean-tracklist>Κράτησε μόνο τίτλους</button><span data-tracklist-clean-message role="status" aria-live="polite"></span></div><textarea name="tracks_disc_2" rows="7" aria-label="Tracklist CD 2">${esc(trackFields.disc2)}</textarea></div><small class="discogs-credit">Data provided by <a href="https://www.discogs.com" target="_blank" rel="noreferrer">Discogs</a>.</small></section>
-    <div class="release-content-grid"><section id="${formScope}-content" class="release-content-card release-anchor"><div class="release-card-heading"><span class="release-step">6</span><div><strong>Περιγραφή &amp; links</strong><small>Προαιρετικό κείμενο, YouTube video και Spotify link της ανάρτησης.</small></div></div><label>Περιγραφή<textarea name="description" rows="4">${esc(r?.description || "")}</textarea></label><div class="youtube-url-row"><label>YouTube video URL<input type="url" name="youtube_url" value="${attr(r?.youtube_url || "")}" placeholder="https://www.youtube.com/watch?v=..."><small>Δέχεται κανονικό link, youtu.be, Short ή Live.</small></label></div><div class="youtube-url-row"><label>Spotify link<input type="url" name="spotify_url" value="${attr(r?.spotify_url || "")}" placeholder="https://open.spotify.com/track/..."><small>Track, album, playlist, artist, show ή episode.</small></label></div><small>Αν δεν υπάρχει ήδη αρχείο, το MP4 προετοιμάζεται αυτόματα στο background μόλις δημοσιευτεί η ανάρτηση.</small><div class="discogs-tools"><button class="youtube-fetch" type="button">Αυτόματη συμπλήρωση από YouTube</button><span class="youtube-message discogs-message" role="status" aria-live="polite"></span></div></section>
+    <div class="release-content-grid"><section id="${formScope}-content" class="release-content-card release-anchor"><div class="release-card-heading"><span class="release-step">6</span><div><strong>Περιγραφή &amp; links</strong><small>Δικό σου βίντεο, περιγραφή, YouTube και Spotify.</small></div></div><label>Δικό μου βίντεο (MP4 / WebM, έως 500 MB)<input type="file" name="video_file" accept="video/mp4,video/webm,.mp4,.webm"><small>Αναπαραγωγή μέσα στο post. Για καλύτερη συμβατότητα επίλεξε MP4 με H.264 / AAC. Όλα τα αρχεία της φόρμας μαζί έως 500 MB.${r?.video_filename ? ` Υπάρχει ήδη βίντεο: ${esc(r.video_name || r.video_filename)}.` : ""}</small></label><label>Περιγραφή<textarea name="description" rows="4">${esc(r?.description || "")}</textarea></label><div class="youtube-url-row"><label>YouTube video URL<input type="url" name="youtube_url" value="${attr(r?.youtube_url || "")}" placeholder="https://www.youtube.com/watch?v=..."><small>Δέχεται κανονικό link, youtu.be, Short ή Live.</small></label></div><div class="youtube-url-row"><label>Spotify link<input type="url" name="spotify_url" value="${attr(r?.spotify_url || "")}" placeholder="https://open.spotify.com/track/..."><small>Track, album, playlist, artist, show ή episode.</small></label></div><small>Αν δεν υπάρχει ήδη αρχείο, το MP4 προετοιμάζεται αυτόματα στο background μόλις δημοσιευτεί η ανάρτηση.</small><div class="discogs-tools"><button class="youtube-fetch" type="button">Αυτόματη συμπλήρωση από YouTube</button><span class="youtube-message discogs-message" role="status" aria-live="polite"></span></div></section>
     <details id="${formScope}-extras" class="release-secondary-card release-anchor"><summary><strong>Προαιρετικές ρυθμίσεις</strong><small>Είδος, μορφή και σειρά εμφάνισης.</small></summary><div class="form-grid three"><label>Είδος<input name="genre" value="${attr(r?.genre || "Hip Hop")}"></label><label>Μορφή / μέγεθος<input name="format" value="${attr(r?.format || "MP3")}"></label><label>Σειρά<input type="number" name="position" value="${r?.position || 0}"></label></div></details></div>
-    ${r ? `<div class="checks"><label><input type="checkbox" name="remove_cover" value="1"> Αφαίρεση εξωφύλλου</label><label><input type="checkbox" name="remove_download" value="1"> Αφαίρεση download</label></div>` : ""}<div class="release-actions"${r ? ` id="release-actions-${r.id}"` : ""}><button class="release-preview" type="submit" formaction="/admin/releases/preview" formtarget="_blank">Preview</button><button class="release-save" type="submit" name="publish_action" value="save">Αποθήκευση Ανάρτησης</button><button class="primary release-publish" type="submit" name="publish_action" value="publish">Δημοσίευση</button></div></form>`;
+    ${r ? `<div class="checks"><label><input type="checkbox" name="remove_cover" value="1"> Αφαίρεση εξωφύλλου</label><label><input type="checkbox" name="remove_download" value="1"> Αφαίρεση download</label><label><input type="checkbox" name="remove_video" value="1"> Αφαίρεση δικού μου βίντεο</label></div>` : ""}<div class="release-actions"${r ? ` id="release-actions-${r.id}"` : ""}><button class="release-preview" type="submit" formaction="/admin/releases/preview" formtarget="_blank">Preview</button><button class="release-save" type="submit" name="publish_action" value="save">Αποθήκευση Ανάρτησης</button><button class="primary release-publish" type="submit" name="publish_action" value="publish">Δημοσίευση</button></div></form>`;
 }
 
 function page(title, body, settings = null, extraHead = "", social = null, analyticsEnabled = false) {
@@ -935,7 +1003,7 @@ function page(title, body, settings = null, extraHead = "", social = null, analy
   const socialImageAlt = attr(text(social?.imageAlt) || "MY HIP HOP BLOG");
   const defaultImageDetails = social?.image ? "" : '<meta property="og:image:type" content="image/png"><meta property="og:image:width" content="1730"><meta property="og:image:height" content="909">';
   if (analyticsEnabled) extraHead = `${googleAnalyticsHead(googleAnalyticsId)}${extraHead}`;
-  return `<!doctype html><html lang="el" data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><meta name="description" content="${description}"><link rel="canonical" href="${socialUrl}"><meta property="og:type" content="${socialType}"><meta property="og:site_name" content="${attr(settings?.blog_title || "MY HIP HOP BLOG")}"><meta property="og:url" content="${socialUrl}"><meta property="og:title" content="${socialTitle}"><meta property="og:description" content="${description}"><meta property="og:image" content="${socialImage}"><meta property="og:image:secure_url" content="${socialImage}">${defaultImageDetails}<meta property="og:image:alt" content="${socialImageAlt}"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${socialTitle}"><meta name="twitter:description" content="${description}"><meta name="twitter:image" content="${socialImage}"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Sedgwick+Ave+Display&display=swap" rel="stylesheet"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/post-footer.css?v=7"><link rel="stylesheet" href="/blog-utility.css?v=2"><link rel="stylesheet" href="/graffiti-title.css?v=5"><link rel="stylesheet" href="/youtube-embed.css?v=1"><link rel="stylesheet" href="/spotify-embed.css?v=1">${extraHead}</head><body>${body}</body></html>`;
+  return `<!doctype html><html lang="el" data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><meta name="description" content="${description}"><link rel="canonical" href="${socialUrl}"><meta property="og:type" content="${socialType}"><meta property="og:site_name" content="${attr(settings?.blog_title || "MY HIP HOP BLOG")}"><meta property="og:url" content="${socialUrl}"><meta property="og:title" content="${socialTitle}"><meta property="og:description" content="${description}"><meta property="og:image" content="${socialImage}"><meta property="og:image:secure_url" content="${socialImage}">${defaultImageDetails}<meta property="og:image:alt" content="${socialImageAlt}"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${socialTitle}"><meta name="twitter:description" content="${description}"><meta name="twitter:image" content="${socialImage}"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Sedgwick+Ave+Display&display=swap" rel="stylesheet"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/post-footer.css?v=7"><link rel="stylesheet" href="/blog-utility.css?v=2"><link rel="stylesheet" href="/graffiti-title.css?v=5"><link rel="stylesheet" href="/youtube-embed.css?v=2"><link rel="stylesheet" href="/spotify-embed.css?v=1">${extraHead}</head><body>${body}</body></html>`;
 }
 
 function absoluteSiteUrl(value) {
@@ -1527,6 +1595,12 @@ function storeLocalYouTubeMp4(sourcePath, name) {
   const filename = `${crypto.randomUUID()}.mp4`;
   fs.renameSync(sourcePath, path.join(uploadDir, filename));
   return { key: "", url: `/download/${filename}`, name };
+}
+function removeVideo(filename) {
+  const target = videoFilePath(videoDir, filename);
+  if (target) {
+    try { fs.rmSync(target, { force: true }); } catch (error) { console.warn("Unable to remove video", error.message); }
+  }
 }
 function removeLocalDownload(downloadUrl) {
   if (!String(downloadUrl || "").startsWith("/download/")) return;

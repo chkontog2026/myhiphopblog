@@ -47,7 +47,7 @@ test("recognizes European proxy probes and extracts their latency", () => {
   assert.equal(parseProxyProbeOutput('{"success":true,"country_code":"SG"}\n__PROXY_TIME__:0.2').isEuropean, false);
 });
 
-test("ranks healthy European proxies first and omits non-European exits", () => {
+test("ranks healthy European proxies first and retains non-European exits as fallback", () => {
   const proxies = [
     "http://user:pass@10.0.0.1:8080/",
     "http://user:pass@10.0.0.2:8080/",
@@ -58,10 +58,10 @@ test("ranks healthy European proxies first and omits non-European exits", () => 
     [proxyIdentity(proxies[1])]: { isEuropean: true, latencyMs: 250 },
     [proxyIdentity(proxies[2])]: { isEuropean: true, latencyMs: 90 },
   };
-  assert.deepEqual(rankProxyUrls(proxies, health), [proxies[2], proxies[1]]);
+  assert.deepEqual(rankProxyUrls(proxies, health), [proxies[2], proxies[1], proxies[0]]);
 });
 
-test("temporarily skips a failed proxy and falls back when every proxy is cooling down", () => {
+test("skips failed proxies and waits when every proxy is cooling down", () => {
   const proxies = ["http://10.0.0.1:8080/", "http://10.0.0.2:8080/"];
   const now = 1_000;
   const health = {
@@ -70,5 +70,5 @@ test("temporarily skips a failed proxy and falls back when every proxy is coolin
   };
   assert.deepEqual(rankProxyUrls(proxies, health, now), [proxies[1]]);
   health[proxyIdentity(proxies[1])].cooldownUntil = now + 60_000;
-  assert.deepEqual(rankProxyUrls(proxies, health, now), proxies);
+  assert.deepEqual(rankProxyUrls(proxies, health, now), []);
 });

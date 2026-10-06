@@ -21,7 +21,8 @@ document.addEventListener("DOMContentLoaded", () => {
       if (event.submitter?.formAction.endsWith("/admin/releases/preview")) return;
       const keepActionsVisible = event.submitter?.name === "publish_action" && event.submitter.value === "save";
       const releaseId = form.querySelector('input[name="id"]')?.value || "";
-      const saveExistingRelease = keepActionsVisible && Boolean(releaseId);
+      const videoChanged = Boolean(form.querySelector('input[name="video_file"]')?.files?.length || form.querySelector('input[name="remove_video"]')?.checked);
+      const saveExistingRelease = keepActionsVisible && Boolean(releaseId) && !videoChanged;
       if (keepActionsVisible && !saveExistingRelease) {
         window.sessionStorage.setItem("release-save-position", String(Date.now()));
       }
