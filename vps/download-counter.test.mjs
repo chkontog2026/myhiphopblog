@@ -25,12 +25,17 @@ test("counts one download per IP and album and shows the total in admin", async 
       SESSION_SECRET: sessionSecret,
       GOOGLE_ANALYTICS_ID: "G-601F0MJFR1",
     },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
   });
+  let serverErrors = "";
+  server.stderr.setEncoding("utf8");
+  server.stderr.on("data", (chunk) => { serverErrors = (serverErrors + chunk).slice(-8000); });
   let database;
 
   try {
-    await waitUntilHealthy(port, server);
+    await waitUntilHealthy(port, server).catch((error) => {
+      throw new Error(`${error.message}\n${serverErrors}`, { cause: error });
+    });
     database = new DatabaseSync(path.join(dataDir, "blog.sqlite"));
     database.prepare("UPDATE releases SET download_url = ? WHERE id IN (1, 2)")
       .run("https://example.com/album.zip");
@@ -230,7 +235,7 @@ test("counts one download per IP and album and shows the total in admin", async 
     assert.match(admin, /class="release-delete-button"[^>]+data-delete-form="delete-release-1"/);
     assert.match(admin, /class="release-preview"[^>]+formaction="\/admin\/releases\/preview" formtarget="_blank">Preview<\/button>/);
     assert.match(admin, /admin-discogs\.css\?v=18/);
-    assert.match(admin, /admin-upload\.js\?v=8/);
+    assert.match(admin, /admin-upload\.js\?v=9/);
 
     const csv = await fetch(`http://127.0.0.1:${port}/admin/newsletter.csv`, {
       headers: { cookie: `nd_session=${expires}.${signature}` },
