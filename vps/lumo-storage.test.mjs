@@ -62,8 +62,11 @@ test(
               contentType: body.contentType,
             }),
           );
-        else if (req.url === "/api/v1/blog-storage/downloads")
-          res.end(JSON.stringify({ url: storageUrl + "/signed-download" }));
+        else if (req.url === "/api/v1/blog-storage/downloads") {
+          const url = new URL(storageUrl + "/signed-download");
+          url.searchParams.set("response-content-disposition", `attachment; filename*=UTF-8''${encodeURIComponent(body.fileName)}`);
+          res.end(JSON.stringify({ url: url.href }));
+        }
         else res.writeHead(404).end();
       } catch {
         res.writeHead(500).end();
@@ -185,7 +188,7 @@ test(
       const signed = await download(musicId);
       assert.equal(signed.status, 302);
       assert.equal(
-        signed.headers.get("location"),
+        signed.headers.get("location").split("?", 1)[0],
         storageUrl + "/signed-download",
       );
       const clip = await readFile(
