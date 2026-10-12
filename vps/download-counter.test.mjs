@@ -25,12 +25,17 @@ test("counts one download per IP and album and shows the total in admin", async 
       SESSION_SECRET: sessionSecret,
       GOOGLE_ANALYTICS_ID: "G-601F0MJFR1",
     },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
   });
+  let serverErrors = "";
+  server.stderr.setEncoding("utf8");
+  server.stderr.on("data", (chunk) => { serverErrors = (serverErrors + chunk).slice(-8000); });
   let database;
 
   try {
-    await waitUntilHealthy(port, server);
+    await waitUntilHealthy(port, server).catch((error) => {
+      throw new Error(`${error.message}\n${serverErrors}`, { cause: error });
+    });
     database = new DatabaseSync(path.join(dataDir, "blog.sqlite"));
     database.prepare("UPDATE releases SET download_url = ? WHERE id IN (1, 2)")
       .run("https://example.com/album.zip");
