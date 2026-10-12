@@ -12,6 +12,7 @@ import multer from "multer";
 import { isUploadedVideo, videoFilePath } from "./owned-video.mjs";
 import { discogsGreekAccentVariants, greeklishDiscogsSearchTerms, normalizeDiscogsSearchText } from "./discogs-lookup.mjs";
 import { downloadContentDisposition, normalizeDownloadFilename } from "./download-filename.mjs";
+import { sendSignedDownload } from "./signed-download.mjs";
 import { googleAnalyticsHead, normalizeGoogleAnalyticsId } from "./google-analytics.mjs";
 import { dateInTimeZone } from "./site-date.mjs";
 import { combineTracklistDiscs, formatDiscogsTracklist, trackCount, tracklistEditorFields, tracklistGroups } from "./tracklist.mjs";
@@ -359,7 +360,7 @@ app.get("/downloads/:id", async (req, res, next) => {
       body: { key: release.download_key, fileName: normalizeDownloadFilename(release.download_name) },
     });
     res.setHeader("Cache-Control", "private, no-store");
-    return res.redirect(302, signed.url);
+    return sendSignedDownload(req, res, next, signed.url, release.download_name);
   }
 
   if (release.download_key && objectStorage?.signedDownloads) {
